@@ -3,7 +3,7 @@ name: VPA Helm E2E Validation
 # This will trigger whenever you push to your branch, or you can run it manually
 on:
   push:
-    branches: [ fix-vpa-e2e-helm ]
+    branches: [ test-fix ]
   workflow_dispatch:
 
 jobs:
