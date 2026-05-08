@@ -1,0 +1,54 @@
+name: VPA Helm E2E Validation
+
+# This will trigger whenever you push to your branch, or you can run it manually
+on:
+  push:
+    branches: [ fix-vpa-e2e-helm ]
+  workflow_dispatch:
+
+jobs:
+  test-vpa-helm:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22' # Kubernetes standard
+
+      - name: Create Kubernetes Kind Cluster
+        uses: helm/kind-action@v1.9.0
+        with:
+          cluster_name: vpa-e2e-cluster
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: 'latest'
+
+      - name: Setup Local Docker Registry
+        run: |
+          # The local script expects a registry on localhost:5001 to push/pull images
+          docker run -d -p 5001:5000 --restart=always --name registry registry:2
+
+      - name: Run VPA Local E2E Script
+        run: |
+          cd vertical-pod-autoscaler
+          
+          # Make scripts executable just in case
+          chmod +x hack/deploy-for-e2e-locally.sh
+          
+          # Run the full suite using the local script (which uses your new values-e2e.yaml!)
+          export REGISTRY=localhost:5001
+          export TAG=gha-test
+          ./hack/deploy-for-e2e-locally.sh full-vpa
+
+      - name: Verify VPA Components are Running
+        run: |
+          echo "Checking if Helm deployed the VPA pods successfully in kube-system namespace..."
+          kubectl get pods -n kube-system -l "app.kubernetes.io/name=vertical-pod-autoscaler"
+          
+          # Wait for pods to become ready
+          kubectl wait --for=condition=ready pod -l "app.kubernetes.io/name=vertical-pod-autoscaler" -n kube-system --timeout=120s
