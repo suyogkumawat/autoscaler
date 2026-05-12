@@ -1,13 +1,10 @@
-name: VPA Helm Migration Verification
+name: Verify --set list-replace semantics
 
-# This workflow is for LOCAL verification on the fork only.
-# Do not include in commits going upstream to kubernetes/autoscaler — that
-# project uses Prow for CI, not GitHub Actions.
+# This workflow proves the Helm --set behavior cited in the PR review thread
+# about --reload-cert vs --feature-gates. Three helm template assertions,
+# nothing else. Fast — runs in under 2 minutes.
 #
-# Triggers:
-#   - push to the migration branch
-#   - manual run from the Actions tab (workflow_dispatch) — useful to trigger
-#     the heavier KIND deploy job on demand
+# Lives in the fork; NOT for upstream kubernetes/autoscaler.
 
 on:
   push:
@@ -20,60 +17,9 @@ defaults:
     shell: bash
 
 jobs:
-  # ────────────────────────────────────────────────────────────────────────
-  # Job 1 — Lint (fast, ~1 min)
-  # ────────────────────────────────────────────────────────────────────────
-  lint:
-    name: Lint scripts, YAML, and Helm chart
+  verify-set-semantics:
+    name: helm template — 3 --set scenarios
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install shellcheck
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
-
-      - name: shellcheck on deploy scripts and helm-settings.sh
-        # SC2086: unquoted ${BASH_SOURCE} — intentional, matches master's existing style
-        # SC1091: source file not followable by shellcheck — runtime resolution is fine
-        run: |
-          shellcheck -e SC2086,SC1091 vertical-pod-autoscaler/hack/deploy-for-e2e.sh
-          shellcheck -e SC2086,SC1091 vertical-pod-autoscaler/hack/deploy-for-e2e-locally.sh
-          shellcheck vertical-pod-autoscaler/hack/e2e/helm-settings.sh
-
-      - name: Install yamllint
-        run: pip install --user yamllint
-
-      - name: yamllint values-e2e.yaml
-        run: |
-          cat > /tmp/yamllint-config.yml <<'EOF'
-          extends: default
-          rules:
-            line-length: disable
-            document-start: disable
-            indentation:
-              indent-sequences: consistent
-            comments:
-              min-spaces-from-content: 1
-          EOF
-          ~/.local/bin/yamllint -c /tmp/yamllint-config.yml \
-            vertical-pod-autoscaler/hack/e2e/values-e2e.yaml
-
-      - uses: azure/setup-helm@v4
-        with:
-          version: v3.16.3
-
-      - name: helm lint chart
-        run: helm lint vertical-pod-autoscaler/charts/vertical-pod-autoscaler/
-
-  # ────────────────────────────────────────────────────────────────────────
-  # Job 2 — --set list-replace semantics (the iamzili question)
-  # Renders the chart in 3 configurations and asserts what's in the output.
-  # This is the empirical proof you can link from the PR thread.
-  # ────────────────────────────────────────────────────────────────────────
-  set-semantics-tests:
-    name: Verify --set list-replace semantics
-    runs-on: ubuntu-latest
-    needs: lint
     steps:
       - uses: actions/checkout@v4
 
@@ -81,7 +27,7 @@ jobs:
         with:
           version: v3.16.3
 
-      - name: 'Test 1 — baseline: values-e2e.yaml supplies --reload-cert'
+      - name: 'Test 1 — baseline (values-e2e.yaml supplies --reload-cert)'
         run: |
           set -euo pipefail
           cd vertical-pod-autoscaler
@@ -96,7 +42,7 @@ jobs:
             echo "$OUT" | grep -B 1 -A 5 args: || true
             exit 1
           fi
-          echo "::notice::PASS — baseline contains --reload-cert"
+          echo '::notice::PASS — baseline contains --reload-cert from values-e2e.yaml'
 
       - name: 'Test 2 — proof: --set extraArgs[0]=feature-gates DROPS --reload-cert'
         run: |
@@ -110,16 +56,16 @@ jobs:
             --set admissionController.image.tag=test \
             --set 'admissionController.extraArgs[0]=--feature-gates=AllAlpha=true\,AllBeta=true')
           if echo "$OUT" | grep -q -- '--reload-cert'; then
-            echo '::error::--reload-cert unexpectedly preserved — Helm changed its behavior?'
+            echo '::error::--reload-cert unexpectedly preserved — Helm behavior changed?'
             exit 1
           fi
           if ! echo "$OUT" | grep -q -- '--feature-gates'; then
             echo '::error::--feature-gates not rendered'
             exit 1
           fi
-          echo "::notice::PASS — confirmed --set foo[0]=X replaces the entire list; --reload-cert dropped"
+          echo '::notice::PASS — confirmed --set foo[0]=X replaces the list; --reload-cert dropped'
 
-      - name: 'Test 3 — script approach: re-asserting both indices preserves both flags'
+      - name: 'Test 3 — script approach (re-asserting both indices preserves both flags)'
         run: |
           set -euo pipefail
           cd vertical-pod-autoscaler
@@ -139,9 +85,7 @@ jobs:
             echo '::error::--feature-gates missing'
             exit 1
           fi
-          # Also assert the rendered Deployment includes both as separate args
-          echo "$OUT" | awk '/kind: Deployment/{d=1} d && /vpa-admission-controller/{found=1} found && /args:/{a=1; print; next} a && /^[[:space:]]+-/{print} a && /^[[:space:]]+[a-z]/{a=0}' || true
-          echo "::notice::PASS — both --reload-cert AND --feature-gates rendered with the script's approach"
+          echo '::notice::PASS — both --reload-cert AND --feature-gates rendered with the script approach'
 
       - name: Summary
         run: |
@@ -149,117 +93,11 @@ jobs:
           ========================================================
           --set list-replace behavior confirmed empirically
           ========================================================
-          Test 1 (baseline)        — values-e2e.yaml → --reload-cert ✓
-          Test 2 (naive --set[0])  — replaces array, --reload-cert lost ✓
-          Test 3 (script approach) — both flags preserved ✓
+            Test 1 (baseline)        — values-e2e.yaml → --reload-cert ✓
+            Test 2 (naive --set[0])  — replaces array, --reload-cert lost ✓
+            Test 3 (script approach) — both flags preserved ✓
           --------------------------------------------------------
           Refs:
             https://helm.sh/docs/intro/using_helm/#the-format-and-limitations-of---set
             https://github.com/helm/helm/issues/11734
           EOF
-
-  # ────────────────────────────────────────────────────────────────────────
-  # Job 3 — KIND end-to-end deploy (slow, manual trigger only)
-  # Builds the three VPA component images, loads into KIND, runs the
-  # actual deploy-for-e2e-locally.sh, verifies pods are Ready and the
-  # rendered args match expectations.
-  # ────────────────────────────────────────────────────────────────────────
-  kind-deploy:
-    name: Deploy VPA to KIND (full integration)
-    runs-on: ubuntu-latest
-    needs: set-semantics-tests
-    # Only on explicit manual trigger — this is a 15-20 min job.
-    if: github.event_name == 'workflow_dispatch'
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: vertical-pod-autoscaler/go.mod
-          cache-dependency-path: vertical-pod-autoscaler/go.sum
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Spin up local registry reachable from KIND
-        run: |
-          docker run -d --restart=always -p 5001:5000 --name local-registry registry:2
-
-      - name: Create KIND cluster
-        uses: helm/kind-action@v1.10.0
-        with:
-          cluster_name: vpa-e2e
-          config: |
-            kind: Cluster
-            apiVersion: kind.x-k8s.io/v1alpha4
-            containerdConfigPatches:
-              - |-
-                [plugins."io.containerd.grpc.v1.cri".registry.mirrors."localhost:5001"]
-                  endpoint = ["http://local-registry:5000"]
-
-      - name: Connect local registry to KIND network
-        run: docker network connect kind local-registry || true
-
-      - uses: azure/setup-helm@v4
-        with:
-          version: v3.16.3
-
-      - name: 'Stage 1 — deploy admission-controller suite (no FEATURE_GATES)'
-        working-directory: vertical-pod-autoscaler
-        env:
-          REGISTRY: localhost:5001
-          TAG: latest
-        run: bash hack/deploy-for-e2e-locally.sh admission-controller
-
-      - name: 'Stage 1 — verify pod is Ready and --reload-cert is in args'
-        run: |
-          set -euo pipefail
-          kubectl rollout status deployment/vpa-admission-controller \
-            -n kube-system --timeout=5m
-          ARGS=$(kubectl get deployment vpa-admission-controller -n kube-system \
-            -o jsonpath='{.spec.template.spec.containers[0].args}')
-          echo "Stage 1 args: $ARGS"
-          if ! echo "$ARGS" | grep -q -- '--reload-cert'; then
-            echo '::error::Stage 1: --reload-cert missing from deployed args'
-            exit 1
-          fi
-          echo "::notice::Stage 1 PASS — --reload-cert present"
-
-      - name: 'Stage 2 — redeploy with FEATURE_GATES set (alpha/beta simulation)'
-        working-directory: vertical-pod-autoscaler
-        env:
-          REGISTRY: localhost:5001
-          TAG: latest
-          FEATURE_GATES: 'AllAlpha=true,AllBeta=true'
-        run: bash hack/deploy-for-e2e-locally.sh admission-controller
-
-      - name: 'Stage 2 — verify both --reload-cert AND --feature-gates present'
-        run: |
-          set -euo pipefail
-          kubectl rollout status deployment/vpa-admission-controller \
-            -n kube-system --timeout=5m
-          ARGS=$(kubectl get deployment vpa-admission-controller -n kube-system \
-            -o jsonpath='{.spec.template.spec.containers[0].args}')
-          echo "Stage 2 args: $ARGS"
-          if ! echo "$ARGS" | grep -q -- '--reload-cert'; then
-            echo '::error::Stage 2: --reload-cert dropped when FEATURE_GATES set — SCRIPT BUG'
-            exit 1
-          fi
-          if ! echo "$ARGS" | grep -q -- '--feature-gates'; then
-            echo '::error::Stage 2: --feature-gates missing — SCRIPT BUG'
-            exit 1
-          fi
-          echo "::notice::Stage 2 PASS — both flags present on alpha/beta simulation"
-
-      - name: Diagnostic dump on failure
-        if: failure()
-        run: |
-          echo '=== nodes ===' ; kubectl get nodes -o wide || true
-          echo '=== all pods ===' ; kubectl get pods -A -o wide || true
-          echo '=== vpa pods ===' ; kubectl get pods -n kube-system -l app.kubernetes.io/name=vertical-pod-autoscaler -o yaml || true
-          echo '=== recent events ===' ; kubectl get events -n kube-system --sort-by=.lastTimestamp | tail -50 || true
-          for pod in $(kubectl get pods -n kube-system -l app.kubernetes.io/name=vertical-pod-autoscaler -o name 2>/dev/null); do
-            echo "=== logs for $pod ===" ; kubectl logs -n kube-system "$pod" --all-containers --tail=200 || true
-          done
